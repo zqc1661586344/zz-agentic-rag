@@ -1,0 +1,98 @@
+"""Streamlit application entry point — RAG document Q&A system.
+
+Two-page layout:
+- Chat (default): SSE streaming RAG conversation
+- Documents: upload, list, delete documents
+
+Uses st.navigation (multipage) or sidebar selectbox for page switching.
+Since streamlit run doesn't use the folder-as-pages convention here,
+we manage pages manually via a sidebar selectbox.
+"""
+
+import os
+import sys
+from pathlib import Path
+
+# streamlit run 默认不把项目根目录加入 sys.path，导致 package import 失败。
+# 这里手动将项目根目录加入搜索路径，确保 from app.xxx 能找到。
+_proj_root = str(Path(__file__).resolve().parent.parent.parent)
+if _proj_root not in sys.path:
+    sys.path.insert(0, _proj_root)
+
+import streamlit as st
+
+from app.logging_config import get_logger
+from app.streamlit_app.auth import logout, restore_session_from_local_storage
+from app.streamlit_app.views.chat import new_conversation, page as chat_page
+from app.streamlit_app.views.documents import page as documents_page
+from app.streamlit_app.views.login import page as login_page
+
+logger = get_logger(__name__)
+
+
+def main():
+    st.set_page_config(
+        page_title="RAG 文档问答系统",
+        page_icon="📚",
+        layout="wide",
+    )
+
+    # 入口守卫：未认证时先尝试从浏览器 localStorage 静默恢复登录
+    # （解决 F5/关标签/新开标签后 session_state 被清空、跳回登录页的问题）；
+    # 恢复失败才渲染登录/注册页，不进入任何业务页面。
+    if not st.session_state.get("authenticated") and not restore_session_from_local_storage():
+        login_page()
+        st.stop()
+
+    # Page selection persisted in URL query param (?page=chat|docs) so that
+    # browser refresh (F5) keeps the user on the same page instead of resetting
+    # to chat when a fresh Streamlit session is created.
+    page = st.query_params.get("page", "chat")
+    page_options = ["💬 对话", "📁 文档管理"]
+    page_keys = ["chat", "docs"]
+
+    # Find the radio index matching the current page
+    try:
+        radio_idx = page_keys.index(page)
+    except ValueError:
+        radio_idx = 0
+
+    with st.sidebar:
+        st.markdown(f"👤 **{st.session_state.get('username', '用户')}**")
+        if st.button("退出登录", use_container_width=True):
+            logout()
+            st.rerun()
+        st.divider()
+
+        choice = st.radio(
+            "导航",
+            options=page_options,
+            index=radio_idx,
+            label_visibility="collapsed",
+            key="nav",
+        )
+
+        # If the user clicked a different page option, update URL param and rerun
+        selected_key = page_keys[page_options.index(choice)]
+        if selected_key != page:
+            st.query_params["page"] = selected_key
+            st.rerun()
+
+        # Sidebar extras shown only on the chat page
+        if page == "chat":
+            if st.button("📝 新对话", use_container_width=True):
+                new_conversation()
+                st.rerun()
+
+        st.divider()
+        st.caption(f"RAG 文档问答系统 v0.1.0")
+
+    # Page routing
+    if page == "docs":
+        documents_page()
+    else:
+        chat_page()
+
+
+if __name__ == "__main__":
+    main()

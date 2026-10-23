@@ -1,0 +1,680 @@
+"""混合检索器——BM25稀疏+PGVector密集+RRF融合+可选交叉编码器重新排序。
+
+核心设计：每个用户拥有独立的 BM25 索引（含私有文档 + 全部共享文档），superuser 使用 "__all__" 键的全量索引。
+
+Usage:
+    hybrid_search(query, top_k=5, user_id=None) → list[Document]
+        chain.py中的检索入口点。
+"""
+
+import json
+import time
+import threading
+from langchain_core.documents import Document
+
+from app.config import settings
+from app.cache.redis_client import get_redis_client
+from app.logging_config import get_logger
+from app.database import SessionLocal
+from app.rag.tokenizer import chinese_tokenizer
+from app.rag.vector_store import _user_where, get_vector_store, similarity_search_with_relevance
+
+logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Per-user BM25 indexes (in-memory, rebuilt from DocumentChunk on changes)
+# ---------------------------------------------------------------------------
+_bm25_map: dict[str, "BM25Retriever | None"] = {}
+_bm25_ts_map: dict[str, float] = {}
+_bm25_lock = threading.RLock()
+
+# 进程内 LRU 缓存上限，防止内存无限增长
+_BM25_LRU_MAX = 500
+
+# 配了 Redis 但读不到数据版本号（TS 过期/从未标记）时的本地兜底 TTL（秒）：该窗口内复用最近一次重建的索引，避免 fail-closed 导致每次查询都全量重建。
+_BM25_LOCAL_TTL = 300
+
+# "加载中"标记：防止 TOCTOU 竞态下多个线程同时重建同一用户的 BM25 索引
+_LOADING: "BM25Retriever | None" = object()
+
+# 哨兵：不在缓存中（区别于 None=合法空索引）
+_CACHE_MISS = object()
+
+
+def _evict_lru() -> None:
+    """当 _bm25_map 达到上限时，淘汰一个旧条目。
+
+    策略：弹出第一个键（Python 3.7+ dict 保持插入顺序）。
+    不淘汰 _LOADING 条目，因为重建中的 key 应该完成。
+    """
+    with _bm25_lock:
+        while len(_bm25_map) >= _BM25_LRU_MAX:
+            for k in list(_bm25_map.keys()):
+                if _bm25_map[k] is not _LOADING:
+                    _bm25_map.pop(k, None)
+                    _bm25_ts_map.pop(k, None)
+                    break
+            else:
+                # 全是 _LOADING 条目——不应发生，但以防万一直接返回
+                break
+
+
+def _redis_ts_key(user_key: str) -> str:
+    """用于BM25重建时间戳的Redis键。"""
+    return f"bm25:ts:{user_key}"
+
+
+def _set_redis_ts(user_key: str, value: float) -> None:
+    """写入数据版本号（Redis），仅由"数据变更"路径（mark_bm25_data_changed）调用。"""
+
+    r = get_redis_client()
+    if r is not None:
+        try:
+            r.setex(_redis_ts_key(user_key), settings.redis_bm25_cache_ttl_seconds, value)
+        except Exception:
+            logger.error(f"Failed to update Redis BM25 ts for {user_key}")
+
+
+def _get_redis_ts(user_key: str) -> float | None:
+    """读取数据版本号；未配置 Redis/无记录/已过期返回 None。"""
+    if not settings.celery_broker_url:
+        return None
+
+    r = get_redis_client()
+    if r is None:
+        logger.warning(
+            "Redis client unavailable, BM25 cache version check degraded to local TTL for %s",
+            user_key,
+        )
+        return None
+    try:
+        ts = r.get(_redis_ts_key(user_key))
+        return float(ts) if ts is not None else None
+    except Exception:
+        logger.warning("Failed to read Redis BM25 ts for %s, degraded to local TTL", user_key)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Public API — per-user BM25 refresh
+# ---------------------------------------------------------------------------
+
+
+def _rebuild_bm25_for_key(key: str, texts: list[str], metadatas: list[dict]) -> None:
+    """线程安全地重建单个用户的 BM25 索引。"""
+    from langchain_community.retrievers import BM25Retriever
+
+    with _bm25_lock:
+        if not texts:
+            _bm25_map[key] = None
+            _bm25_ts_map[key] = time.time()  # 记录空索引时间戳
+            logger.info(f"BM25 for {key}: empty (no chunks)")
+            return
+
+        _evict_lru()  # 插入前触发 LRU 淘汰
+
+        _bm25_map[key] = BM25Retriever.from_texts(
+            texts,
+            metadatas=metadatas,
+            k=max(10, settings.rag_rerank_top_n),
+            preprocess_func=chinese_tokenizer,
+        )
+        _bm25_ts_map[key] = time.time()  # 记录本地时间戳
+        logger.info(f"BM25 for {key}: built from {len(texts)} chunks")
+
+
+def refresh_bm25_for_user(user_id: str) -> None:
+    """从 document_chunks 读取该用户的私有 + 全部共享文档，重建 BM25。
+
+    Args:
+        user_id: 用户ID。若传入 "__all__" 则重建全量 BM25 索引（供 superuser 使用）。
+    """
+    if user_id == "__all__":
+        refresh_bm25_all()
+        return
+
+    from app.models.document import Document, DocumentChunk
+
+    db = SessionLocal()
+    try:
+        chunks = (
+            db.query(DocumentChunk)
+            .join(Document, DocumentChunk.document_id == Document.id)
+            .filter(
+                (Document.uploaded_by == user_id) | (Document.visibility == "shared"),
+                Document.status
+                == "indexed",  # 与 pg_tsvector 一致：跳过 failed/pending 文档的 chunk
+                DocumentChunk.content.isnot(None),
+            )
+            .all()
+        )
+        texts = [c.content for c in chunks]
+        metadatas = [json.loads(c.meta_json) if c.meta_json else {} for c in chunks]
+
+        _rebuild_bm25_for_key(user_id, texts, metadatas)
+        # 注意：不再调用 _update_redis_ts —— 这里只重建本地索引，不写数据版本号
+    finally:
+        db.close()
+
+
+def refresh_bm25_all() -> None:
+    """从document_chunks读取全部已索引文档，重建全量 BM25（供 superuser "__all__" 使用）。"""
+    from app.models.document import Document, DocumentChunk
+
+    db = SessionLocal()
+    try:
+        chunks = (
+            db.query(DocumentChunk)
+            .join(Document, DocumentChunk.document_id == Document.id)
+            .filter(Document.status == "indexed", DocumentChunk.content.isnot(None))
+            .all()
+        )
+        texts = [c.content for c in chunks]
+        metadatas = [json.loads(c.meta_json) if c.meta_json else {} for c in chunks]
+
+        _rebuild_bm25_for_key("__all__", texts, metadatas)
+        # 注意：不再调用 _update_redis_ts —— 这里只重建本地索引，不写数据版本号
+    finally:
+        db.close()
+
+
+def mark_bm25_data_changed(user_id: str | None = None, *, shared: bool = False) -> None:
+    """文档上传/删除后调用：更新数据版本号（Redis）并清空本地缓存。
+
+    数据版本号（Redis TS）只在"数据变更"路径更新，供多 worker 在下次查询时按版本号懒重建；本地缓存在本进程内同步清空。懒重建本身不再写版本号，避免"自己刚建完又被判过期"的自失效。
+
+    Args:
+        user_id: 直接受影响的用户 ID（其私有+共享索引需重建）。None 表示不指定具体用户。
+        shared: 变更的是共享文档，会影响其他所有用户的索引，需一并失效。
+    """
+    now = time.time()
+    # superuser 全量索引（__all__）包含所有私有+共享文档，任何变更都使其失效
+    keys: set[str] = {"__all__"}
+    if user_id:
+        keys.add(str(user_id))
+
+    if shared:
+        with _bm25_lock:
+            keys.update(_bm25_map.keys())  # 本进程已知的所有用户索引均受共享文档影响
+
+    with _bm25_lock:
+        for k in keys:
+            _bm25_map.pop(k, None)
+            _bm25_ts_map.pop(k, None)
+
+    for k in keys:
+        _set_redis_ts(k, now)
+
+
+def _get_bm25_bypass(key: str) -> "BM25Retriever | None":
+    """旁路模式：每次都从 DB 重建，不读缓存。"""
+    if key == "__all__":
+        refresh_bm25_all()
+    else:
+        refresh_bm25_for_user(key)
+
+    with _bm25_lock:
+        cached = _bm25_map.get(key)
+        return cached if cached is not _LOADING else None
+
+
+def _resolve_redis_ts(key: str) -> float | None:
+    """解析该 key 的有效数据版本号（合并 __all__ 的共享文档变更）。"""
+    redis_ts = _get_redis_ts(key)
+    # 共享文档变更会更新 "__all__" 版本号；若本用户的 key 已过期（Redis_ts=None），仍须通过 __all__ 感知共享文档变化，否则该 worker 会永远读到旧共享内容。
+    if key != "__all__":
+        all_ts = _get_redis_ts("__all__")
+        if all_ts is not None:
+            redis_ts = max(redis_ts or 0.0, all_ts)
+    return redis_ts
+
+
+def _check_bm25_cache(key: str, redis_ts: float | None) -> "BM25Retriever | None | _CACHE_MISS":
+    """检查本地缓存是否有效。
+
+    返回值：
+      - BM25Retriever → 缓存命中
+      - None → 缓存命中，但值为空索引（其他线程正在加载，或已知无数据）
+      - _CACHE_MISS → 缓存缺失或过期（调用方应重建）
+    """
+    with _bm25_lock:
+        if key not in _bm25_map:
+            # 不在缓存中 → 标记为加载中，防止并发重建
+            _bm25_map[key] = _LOADING  # type: ignore[assignment]
+            return _CACHE_MISS
+
+        cached = _bm25_map[key]
+        if cached is _LOADING:
+            return None  # 其他线程正在重建，本次查询跳过
+
+        if redis_ts is None:
+            # Redis 不可用 → 纯本地缓存模式
+            if not settings.celery_broker_url:
+                return cached  # 无 Redis，完全信任本地缓存
+
+            # 配置了 Redis 但读不到版本号（TS 过期 / 该 key 从未被标记）：用本地时间戳做短 TTL 兜底，避免 fail-closed 导致每次查询都全量重建。索引只要在 _BM25_LOCAL_TTL 内重建过即可直接命中；_rebuild_bm25_for_key内部已写 _bm25_ts_map[key]=time.time()，这里直接读它判断新旧。
+            local_ts = _bm25_ts_map.get(key, 0.0)
+            if time.time() - local_ts < _BM25_LOCAL_TTL:
+                return cached
+        else:
+            # Redis 模式：本地 TS >= 数据版本号 → 缓存有效
+            local_ts = _bm25_ts_map.get(key, 0.0)
+            if local_ts >= redis_ts:
+                return cached
+
+        # 缓存过期 → 标记为加载中，让调用方重建
+        _bm25_map[key] = _LOADING  # type: ignore[assignment]
+        return _CACHE_MISS
+
+
+def _rebuild_bm25_cache(key: str, redis_ts: float | None) -> "BM25Retriever | None":
+    """锁外重建 BM25 索引（调用方确保 _bm25_map[key] 已被标记为 _LOADING）。"""
+    try:
+        if key == "__all__":
+            refresh_bm25_all()
+        else:
+            refresh_bm25_for_user(key)
+    except Exception:
+        logger.warning("BM25 rebuild failed for %s", key, exc_info=True)
+        with _bm25_lock:
+            _bm25_map.pop(key, None)
+            _bm25_ts_map.pop(key, None)
+        return None
+
+    with _bm25_lock:
+        if redis_ts is not None:
+            _bm25_ts_map[key] = redis_ts  # 对齐版本号，避免下次误判过期
+        return _bm25_map.get(key)
+
+
+def get_bm25_for_user(user_id: str | None) -> "BM25Retriever | None":
+    """懒加载获取用户的 BM25 索引（线程安全，sentinel 防重复重建）。
+
+    跨 worker 一致性模式：
+      - 如果 Redis 可用，比较本地 _bm25_ts_map 与 Redis 时间戳。
+        Redis 时间戳更新 → 本地缓存失效并重建。
+      - 如果 Redis 不可用，回退纯本地缓存模式（单进程正确）。
+      - 如果 rag_bm25_cache_bypass=True，每次都从 DB 重建（最慢但最正确）。
+
+    Args:
+        user_id: 用户ID。None 表示 superuser（使用 "__all__" 索引）。
+
+    Returns:
+        BM25Retriever 实例，或 None（无数据/正在加载中）。
+    """
+    key = user_id if user_id is not None else "__all__"
+
+    # 旁路模式
+    if settings.rag_bm25_cache_bypass:
+        # 每次强制从 DB 重建，不读缓存
+        return _get_bm25_bypass(key)
+
+    # 查 Redis 看"数据版本号应该是多少"
+    redis_ts = _resolve_redis_ts(key)
+
+    # 判定本地缓存是否仍有效
+    cached = _check_bm25_cache(key, redis_ts)
+    if cached is not _CACHE_MISS:
+        return cached
+
+    return _rebuild_bm25_cache(key, redis_ts)
+
+
+# ---------------------------------------------------------------------------
+# Hybrid search — PGVector dense + BM25 sparse → Ensemble (RRF fusion)
+# ---------------------------------------------------------------------------
+def _sparse_docs(query: str, top_k: int, user_id: str | None) -> list[Document]:
+    """按 `rag_sparse_backend` 取回稀疏检索候选（Document 列表，可能为空）。
+
+    - `pg_tsvector` 且 PG 可用：只用 PG，单次查询异常直接向上抛出问题。
+    - `pg_tsvector` 但 PG 不可用（如 SQLite）：告警后回退内存 BM25。
+    - `bm25_memory`：直接用内存 BM25。
+    """
+    # 配置了pg_vector，且数据库可用，直接走 tsvector_search
+    if settings.rag_sparse_backend == "pg_tsvector":
+        from app.rag.sparse_search import is_pg_available, tsvector_search
+
+        if is_pg_available():
+            return tsvector_search(query, top_k=top_k, user_id=user_id)
+
+        logger.warning(
+            "rag_sparse_backend=pg_tsvector but DB is not PostgreSQL (%s); fallback to BM25",
+            settings.database_url.split("://", 1)[0],
+        )
+
+    sparse = get_bm25_for_user(user_id)
+    if sparse is None:
+        logger.warning("BM25 retriever not found for user %s", user_id)
+        return []
+
+    try:
+        return sparse.get_relevant_documents(query)[:top_k]
+    except Exception as e:
+        logger.warning(f"BM25 get_relevant_documents failed: {e}")
+        return []
+
+
+def _rrf_fuse(
+    dense: list[Document], sparse: list[Document], alpha: float, c: int = 60
+) -> list[Document]:
+    """手动的 RRF（Reciprocal Rank Fusion）+ 凸组合权重融合稀疏与稠密结果。
+
+    替代 langchain `EnsembleRetriever`，使 `pg_tsvector` 与 `bm25_memory` 两种稀疏后端走完全相同的融合路径、结果可比。去重键为 `(document_id, page_content)`：
+    - 跨检索器的"同一 chunk"（同文本）折叠为一个 RRF 位置；
+    - 同一文档的不同 chunk（文本不同）保留各自位置，不丢失多 chunk 粒度。
+
+    Returns:
+        已按融合分数降序排列的 Document 列表（保留首次出现的 Document 对象）。
+    """
+    ranked: dict[tuple, tuple[float, Document]] = {}
+    for docs, weight in ((dense, alpha), (sparse, 1.0 - alpha)):
+        for rank, doc in enumerate(docs):
+            # 用 (document_id, page_content) 去重，把"同一个 chunk 在两条路都出现"的贡献累加
+            key = (str(doc.metadata.get("document_id", "")), doc.page_content)
+            # 计算当前文档的 RRF 贡献
+            contribution = weight * (1.0 / (c + rank + 1))
+            cur = ranked.get(key)
+            if cur is None:
+                ranked[key] = (contribution, doc)
+            else:
+                ranked[key] = (cur[0] + contribution, doc)
+
+    # 按融合分降序
+    ordered = sorted(ranked.values(), key=lambda v: v[0], reverse=True)
+    return [doc for _, doc in ordered]
+
+
+def _dense_only_search(query: str, top_k: int, user_id: str | None) -> list[Document]:
+    """稀疏无命中时的纯稠密检索 + spread 判定。
+
+    如果 dense top1 分数过低或 top1/top2 分差过窄 → 返回空（free chat）。
+    """
+    # 第一次：相似度检索 + 取分数 → 只用 top-4 做相关判定
+    scored = similarity_search_with_relevance(query, k=min(top_k, 4), user_id=user_id)
+    if not scored:
+        return []
+
+    top1, spread = scored[0][1], (scored[0][1] - scored[1][1] if len(scored) >= 2 else 1.0)
+
+    # 最高的 cosine 相似度太低 → 完全不相关
+    # top1 和 top2 分差过窄 → 不确定是否相关
+    # 任一命中 → 返回空 = free chat
+    if top1 < settings.rag_min_score or spread < settings.rag_hybrid_min_spread:
+        logger.info(
+            "dense-only top-1=%.3f spread=%.3f (min=%.3f/%.3f) → free chat",
+            top1,
+            spread,
+            settings.rag_min_score,
+            settings.rag_hybrid_min_spread,
+        )
+        return []
+
+    # 第二次：过了判定，才重新召回 top_k 个真正的结果
+    try:
+        vs = get_vector_store()
+        return vs.as_retriever(search_kwargs={"k": top_k, "filter": _user_where(user_id)}).invoke(
+            query
+        )[:top_k]
+    except Exception as e:
+        logger.error("hybrid_search dense-only path failed: %s", e)
+        return []
+
+
+def _hybrid_fusion(
+    query: str, top_k: int, user_id: str | None, sparse_docs: list[Document]
+) -> list[Document]:
+    """稀疏有命中时：稠密检索 → RRF 融合 → 最终分数把关 → 重排。
+
+    即使稀疏有弱命中，如果 dense top1 分数过低 → 返回空（free chat）。
+    """
+
+    # pg_tsvector 后端的弱命中把关已在 SQL WHERE 完成（归一化 ts_rank > min_rank），返回的候选均已达标；bm25_memory 回退无 sparse_score，保持原行为（不加下限）。能走到这里说明 sparse_docs 非空。
+
+    try:
+        vs = get_vector_store()
+        # 稠密检索，取前 top_k 个文档
+        dense_docs = vs.as_retriever(
+            search_kwargs={"k": top_k, "filter": _user_where(user_id)}
+        ).invoke(query)
+    except Exception as e:
+        logger.error("hybrid_search dense path failed, using sparse only: %s", e)
+        dense_docs = []
+
+    # 融合稀疏：sparse_docs 与稠密：dense_docs结果
+    docs = _rrf_fuse(dense_docs, sparse_docs, settings.rag_hybrid_alpha)
+
+    # 【相关性兜底】融合后再用 dense 侧 top1 分数 + spread 离散度双判据判定是否需要 free chat。
+    # 只检查 "dense 是否完全空" 太松——embedding 总会返回向量，PGVector 总能搜到邻近，但 top1 的 cosine 可能极低（query 和文档集完全不相关）。这里用 rag_min_score + rag_hybrid_min_spread 做最终把关：dense top1 < 阈值 或 分数平带（top1-top2 差过窄）→ 即使 sparse 有弱命中（刚好过 min_rank），也说明 query 真的不在知识库范围内，走 free chat。
+    if docs:
+        scored = similarity_search_with_relevance(query, k=min(top_k, 4), user_id=user_id)
+        if not scored:
+            logger.info("hybrid path but cosine found no match at all → free chat")
+            return []
+
+        top1 = scored[0][1]
+        spread = scored[0][1] - scored[1][1] if len(scored) >= 2 else 1.0
+
+        # 虽然稀疏命中了，但如果稠密侧 top1 < min_score 或 spread 过窄 → 说明关键词只是碰巧匹配，实际向量上完全不相关 → 仍判定 free chat
+        if top1 < settings.rag_min_score or spread < settings.rag_hybrid_min_spread:
+            logger.info(
+                "hybrid path dense top-1=%.3f spread=%.3f (min=%.3f/%.3f) → free chat "
+                "(sparse hit too weak to justify RAG)",
+                top1,
+                spread,
+                settings.rag_min_score,
+                settings.rag_hybrid_min_spread,
+            )
+            return []
+
+    # （可选的 LLM/交叉重排）→ 返回 top_k
+    reranked = _maybe_rerank(query, docs)
+    return (reranked or docs)[:top_k]
+
+
+def hybrid_search(query: str, top_k: int = 5, user_id: str | None = None) -> list[Document]:
+    """混合检索：PGVector稠密 + 稀疏 → RRF融合（支持 pg_tsvector 与内存 BM25 两种稀疏后端）。
+
+    【相关性判定策略】
+        - 稀疏有数据且 ts_rank ≥ rag_sparse_min_rank → 关键词真命中，跳过 spread，稠密+稀疏 RRF 融合。（pg_tsvector 后端的下限把关已在 SQL WHERE 完成，此处不重复过滤；bm25_memory 无该分，不加下限。）
+        - 稀疏为空（或 SQL 把关后为空）→ 回退纯稠密 + spread 检查判断 free_chat
+        - 融合后仅当稠密侧对该 query 完全零相关（向量库空）才回退 free chat
+
+    Args:
+        query: 查询字符串
+        top_k: 返回文档数量上限
+        user_id: 用户ID（None=superuser，全量检索）
+
+    Returns:
+        排序后的 Document 列表，或空列表（free chat）。
+    """
+    # 先稀疏检索的目的，是用稀疏命中与否来判断"这个 query 是否该走 RAG"（相关性判定），以及用怎样的方式融合。原因有两点：
+
+    # 稀疏是廉价的关键词预检。检索成本低，能快速判断 query 里是否真的含知识库的关键词。
+    # 决定"是否要额外做 free-chat 判定"。如果用户问的和知识库无关，就回退成自由对话（free chat），而不是硬塞不相关文档给 LLM。
+
+    # 两条路径最终都靠 dense top1 分数 + spread 离散度双判据决定是否回退 free chat，确保"无关 query 不会被硬塞 RAG 文档"
+
+    # 1. 取稀疏候选；无稀疏数据 → 纯稠密，做 spread 判定
+    try:
+        sparse_docs = _sparse_docs(query, top_k, user_id)
+    except Exception as e:
+        logger.error("sparse retrieval failed: %s", e)
+        sparse_docs = []
+
+    # 稀疏检索为空
+    if not sparse_docs:
+        return _dense_only_search(query, top_k, user_id)
+
+    # 2. 稀疏有命中，说明 query 命中了关键词 → 无需 spread，稠密+稀疏 RRF 融合。
+    return _hybrid_fusion(query, top_k, user_id, sparse_docs)
+
+
+# ---------------------------------------------------------------------------
+# Multi-Query 多路召回 — hybrid_search 的上层编排
+# ---------------------------------------------------------------------------
+
+# 视角扩展 prompt：第 1 个强制原样保留原问题，其余从不同角度改写以增强召回。
+_MULTI_QUERY_EXPAND_PROMPT = """你是一个文档检索专家。请将用户的问题改写为 {n} 个不同的表述，每个表述从一个不同角度尽可能还原用户想查的信息，以利于文档检索召回。
+
+要求：
+1. 第 1 个必须原样保留用户问题。
+2. 其余 {n-1} 个从不同角度改写：补充同义词/关键词、补充上下文、拆解子问题、转换视角等。
+3. 每个表述独占一行，不要编号、不要引号、不要任何额外说明。
+4. 每个表述尽量简洁，不超过 40 字。
+
+用户问题：{query}"""
+
+
+def _expand_query_variants(query: str, n: int) -> list[str]:
+    """调用 LLM 把 query 扩展为 n 个视角的查询列表。
+
+    第一个强制为原问题；LLM 失败/返回异常/行数不足时，用原问题补齐/回退。
+    """
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.prompts import ChatPromptTemplate
+
+    from app.rag.llms import get_llm
+
+    try:
+        prompt = ChatPromptTemplate.from_messages(
+            [("system", _MULTI_QUERY_EXPAND_PROMPT), ("human", "{query}")]
+        )
+        chain = prompt | get_llm() | StrOutputParser()
+        raw = (
+            chain.invoke(
+                {"n": n, "query": query},
+                config={"tags": ["multi_query_expand"]},
+            )
+            or ""
+        ).strip()
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()][:n]
+    except Exception as e:
+        logger.warning("multi-query expansion failed, falling back to single query: %s", e)
+        lines = []
+
+    if not lines:
+        return [query]
+
+    # 强制第 1 路为原问题，确保精度最高的一路永远存在
+    variants = lines
+    if variants[0] != query:
+        variants[0] = query
+    # 补齐到 n 个视角（去空、去与原问题重复的视角），避免候选过少
+    deduped = []
+    seen = set()
+    for v in variants + [query]:
+        if v and v not in seen:
+            deduped.append(v)
+            seen.add(v)
+        if len(deduped) >= n:
+            break
+    return deduped
+
+
+def _cross_query_fuse(
+    ranked_lists: list[list[Document]],
+    top_k: int,
+    primary_weight: float,
+    c: int = 60,
+) -> list[Document]:
+    """多路结果的二级 RRF 融合。
+
+    - 去重键与 _rrf_fuse 一致：(document_id, page_content)
+    - 首路（原问题）权重 primary_weight，其余视角平分 (1-primary_weight)/(n-1)
+    - 同一 chunk 多次出现时合并分数，保留首见 Document
+    """
+    n_eff = len(ranked_lists)
+    if n_eff == 0:
+        return []
+    variant_weight = (1.0 - primary_weight) / (n_eff - 1) if n_eff > 1 else 0.0
+
+    agg: dict[tuple, tuple[float, Document]] = {}
+    for qi, docs in enumerate(ranked_lists):
+        # 首路（原问题）用 primary_weight；后续各视角平分剩余权重
+        w = primary_weight if qi == 0 else variant_weight
+        for rank, doc in enumerate(docs):
+            key = (str(doc.metadata.get("document_id", "")), doc.page_content)
+            contribution = w * (1.0 / (c + rank + 1))
+            cur = agg.get(key)
+            if cur is None:
+                agg[key] = (contribution, doc)
+            else:
+                agg[key] = (cur[0] + contribution, doc)
+
+    ordered = sorted(agg.values(), key=lambda v: v[0], reverse=True)
+    return [doc for _, doc in ordered][:top_k]
+
+
+def multi_query_search(query: str, top_k: int = 5, user_id: str | None = None) -> list[Document]:
+    """多路召回入口：多视角改写 → 逐路 hybrid_search → 二级 RRF 合并。
+
+    每路内部走完整的 hybrid_search（稠密+稀疏+RRF+可选重排），本函数只是上层编排。
+
+    free-chat 判定以原问题（首路）为准：原问题未命中 → 整体返回空（free chat），多路只负责增强召回，不改变"原问题与知识库不相关就走 free chat"的语义。
+    """
+    # 1. 开关关闭 / n<2 / top_k 异常 → 退化为单路 hybrid_search（零开销）
+    if not settings.rag_multi_query_enabled or settings.rag_multi_query_n < 2 or top_k < 1:
+        return hybrid_search(query, top_k=top_k, user_id=user_id)
+
+    # 2. 扩展视角（失败回退 [query]）
+    variants = _expand_query_variants(query, settings.rag_multi_query_n)
+
+    # 3. 逐路检索，候选放大以便去重后仍有足够候选
+    per_query_k = min(int(top_k * settings.rag_multi_query_top_k_scale), 50)
+    per_query_k = max(per_query_k, top_k)  # 至少检索 top_k 个候选
+
+    if len(variants) <= 1:
+        ranked_lists = [hybrid_search(variants[0], top_k=per_query_k, user_id=user_id)]
+    else:
+        # 并行执行各路检索，把串行 n 路的延迟摊到 n 个 worker 上。
+        # 线程安全：embedding/LLM client 均为 lru_cache 单例（remote provider 线程安全），
+        # BM25 走 _bm25_lock(RLock)、PGVector 走连接池、reranker 构建持 _build_lock。
+        # map() 保持传入顺序，保证排名/权重语义与串行完全一致。
+        _workers = min(len(variants), settings.rag_multi_query_max_workers)
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=_workers) as pool:
+            ranked_lists = list(
+                pool.map(lambda q: hybrid_search(q, top_k=per_query_k, user_id=user_id), variants)
+            )
+
+    # 4. free-chat 判定以原问题为准：首路为空 → 整体 free chat
+    if not ranked_lists[0]:
+        return []
+
+    # 5. 其余视角全空 → 直接用原问题结果
+    if all(not rl for rl in ranked_lists[1:]):
+        return ranked_lists[0][:top_k]
+
+    # 6. 二级 RRF 融合 → top_k
+    return _cross_query_fuse(
+        ranked_lists,
+        top_k,
+        settings.rag_multi_query_primary_weight,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Optional cross-encoder reranker (implementation lives in app.rag.rerankers)
+# ---------------------------------------------------------------------------
+
+
+def _maybe_rerank(query: str, docs: list[Document]) -> list[Document] | None:
+    """如果重排器已启用且依赖关系可用，则对文档进行重新排序。
+
+    返回重新排序后的前N个文档，或者当重新排序器被禁用或不可用时返回 None。
+    """
+    from app.rag.rerankers import get_reranker, mark_reranker_failed
+
+    reranker = get_reranker()
+    if reranker is None:
+        return None
+
+    try:
+        reranked = reranker.compress_documents(query=query, documents=docs)
+        return list(reranked)[: settings.rag_rerank_top_n]
+    except Exception as exc:  # noqa: BLE001 — broad catch is intentional: fall back gracefully
+        logger.warning(f"reranker failed, falling back to unranked results: {exc}")
+        mark_reranker_failed()
+        return None

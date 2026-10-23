@@ -1,0 +1,225 @@
+"""Application configuration using pydantic-settings."""
+
+from pathlib import Path
+from typing import Literal
+
+from pydantic import model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    # 配置模型，用于从环境变量加载配置。没有设置 case_sensitive=True —默认大小写不敏感。Pydantic v2的元配置机制，在类定义时由 Pydantic的元类（metaclass）读取。
+    model_config = SettingsConfigDict(
+        env_file=".env",  # 指定环境变量文件
+        env_file_encoding="utf-8",  # 环境变量文件编码
+        extra="ignore",  # 忽略额外的配置项
+    )
+
+    # 运行环境：development / production
+    environment: Literal["development", "production"] = "development"
+
+    # 启动时种子 admin(admin/admin123) 账号：默认关闭。仅开发/测试临时开启；生产与默认配置都不创建，杜绝硬编码超管凭据入库。首次 bootstrap 见 README。
+    seed_demo_user: bool = False
+
+    # App信息配置
+    app_name: str = "Enterprise RAG System"
+    app_debug: bool = True
+
+    # 日志配置信息
+    log_level: str = "INFO"  # 日志级别（DEBUG/INFO/WARNING/ERROR），由 logging_config 读取
+    # 日志文件路径；为空字符串则只输出到标准流，不写文件
+    log_file: str = "./data/logs/app.log"
+    # 日志格式：json 或 plain（plain 为传统文本格式）
+    log_format: str = "plain"
+    # 单个日志文件上限（字节），超过后按该大小轮转
+    log_max_bytes: int = 5 * 1024 * 1024  # 5MB
+    # 保留的轮转日志文件数量
+    log_backup_count: int = 5
+
+    # Database配置；留空时回退 SQLite（开发环境），生产必须设 PG 连接串
+    database_url: str = ""
+    # PostgreSQL 连接池配置（仅 PostgreSQL 生效，SQLite 忽略）
+    db_pool_size: int = 20
+    db_max_overflow: int = 10
+    db_pool_pre_ping: bool = True
+    db_pool_recycle: int = 3600
+
+    # JWT
+    jwt_secret_key: str = "dev-secret-key-do-not-use-in-production-123456"
+    jwt_algorithm: str = "HS256"
+    jwt_access_token_expire_minutes: int = 30
+    jwt_refresh_token_expire_days: int = 7
+
+    # LLM 配置（OpenAI 或 Ollama），默认使用 OpenAI 协议模型
+    llm_provider: Literal["openai", "ollama", "test"] = "openai"
+
+    # LLM 配置（使用远端api 和 key， key和base_url在.env中配置，通过环境变量方式来使用）
+    llm_api_key: str = ""
+    llm_api_base: str = "https://api.openai.com/v1"
+    llm_model: str = "gpt-4o-mini"
+    llm_timeout_seconds: int = 60
+    llm_max_retries: int = 3
+
+    # LLM 使用ollama加载的模型配置
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "qwen2.5:7b"
+    ollama_embedding_model: str = "BAAI/bge-m3"
+
+    # Embedding 模型配置
+    embedding_provider: Literal["openai", "ollama", "test"] = "openai"
+    embedding_api_key: str = ""
+    embedding_api_base: str = "https://api.openai.com/v1"
+    embedding_model: str = "BAAI/bge-m3"
+    embedding_timeout_seconds: int = 30
+    embedding_max_retries: int = 3
+    rag_embedding_dim: int = 1024
+
+    # PGVector 向量库连接串（psycopg3 格式）。读取.env环境变量 VECTOR_STORE_URL
+    vector_store_url: str = ""
+    vector_collection_name: str = "documents"
+
+    # ===== RAG 检索配置 =====
+
+    # --- Pipeline 分片参数 ---
+    chunk_size: int = 800
+    chunk_overlap: int = 150
+
+    # --- 检索算法 ---
+    # similarity（纯向量）/ mmr（多样性）/ hybrid（向量+BM25+RRF融合）
+    rag_search_type: Literal["similarity", "mmr", "hybrid"] = "hybrid"
+
+    # --- Hybrid 融合 ---
+    # 稠密 vs 稀疏权重（0=纯BM25, 1=纯向量）
+    rag_hybrid_alpha: float = 0.3
+    # BM25 缓存绕过：多 worker 下每个进程独立缓存，True 则每次从 DB 读（正确但较慢）
+    rag_bm25_cache_bypass: bool = False
+
+    # --- 稀疏检索后端 ---
+    # bm25_memory（进程内 BM25）/ pg_tsvector（PG 原生 tsvector + ts_rank + GIN）
+    rag_sparse_backend: Literal["bm25_memory", "pg_tsvector"] = "pg_tsvector"
+    # ts_rank 归一化阈值：低于此值的弱命中在 SQL WHERE 层直接过滤
+    rag_sparse_min_rank: float = 0.1
+    # 稠密分数离散度下限（top1-top2）：平带说明与文档集无关 → free chat
+    rag_hybrid_min_spread: float = 0.015
+
+    # --- Rerank 交叉编码器 ---
+    # 默认关闭 rerank。决策依据：RAGAS 评估（k10 组）显示开启后，context_precision 从 0.659 降至 0.607，bge-reranker-v2-m3 场景的排序增益未达预期。待收集更多场景数据后可重新评估开启。
+    rag_rerank_enabled: bool = False
+    # local（本地 HF 模型）/ siliconflow（硅基 /v1/rerank 远端 API）
+    rag_rerank_provider: Literal["local", "siliconflow"] = "siliconflow"
+    rag_rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    # 硅基远端配置；留空则复用 LLM_API_BASE + "/rerank" 和 LLM_API_KEY
+    rag_rerank_api_url: str = ""
+    rag_rerank_api_key: str = ""
+    rag_rerank_top_n: int = 5
+
+    # --- Free Chat 阈值 ---
+    # 稠密 top1 分数低于此值 → 判定为与文档集无关 → free chat
+    rag_min_score: float = 0.4
+
+    # --- Multi-Query 多路召回 ---
+    # 把用户问题扩展为多个视角分别检索再合并，提升复合问题召回率。
+    # 默认开启；关闭后 multi_query_search 退化为单路 hybrid_search（零开销）。
+    rag_multi_query_enabled: bool = True
+    # 含原问题在内的视角数（>=2）。默认 3：原问题 + 2 个改写视角。
+    rag_multi_query_n: int = 3
+    # 原问题在二级 RRF 融合时的权重；其余视角平分 (1-权重)/(n-1)。
+    rag_multi_query_primary_weight: float = 0.5
+    # 每路检索的候选放大倍数（每路实际检索 top_k*放大，合并后再取 top_k）。
+    rag_multi_query_top_k_scale: float = 2.0
+    # 多路检索的并行 worker 上限。各路含 PGVector/稀疏 SQL/embedding 调用，
+    # 串行会把单路延迟放大 n 倍；并行摊到 min(n, max_workers) 个线程上。
+    # 线程安全已满足（lru_cache 单例 client + BM25 RLock + PG 连接池）。
+    rag_multi_query_max_workers: int = 4
+
+    # --- Agentic RAG（路由 + 自纠偏）---
+    # 用 LangGraph 图编排「分析路由 → 检索 → 结构化判分 → 纠偏重检索」。
+    # 默认 True 启用 agentic 流程；设为 False 时 100% 走旧确定性漏斗（chain.py 保留），便于 A/B 回退。
+    rag_agentic_enabled: bool = True
+    # 最多检索轮数（含首轮）。默认 2 = 首轮 + 至多 1 次纠偏重检索，天然防死循环。
+    rag_agentic_max_retrieval_rounds: int = 2
+    # 是否开启 LLM 结构化判分（CRAG）。关闭则退化为依赖既有向量阈值判空，无 LLM 判分环节。
+    rag_agentic_grade_enabled: bool = True
+    # agentic 流程下是否叠加多视角召回（multi_query）。默认关闭以控延迟/成本，追求检索精度用单路即可。
+    rag_agentic_use_multiquery: bool = False
+
+    # --- 自动化回归评估 ---
+    # EvalRun 表保留最近 N 轮评估历史（评估低频低量，默认 30 即可覆盖趋势回顾）。
+    # 写入后自动清理更早记录。
+    rag_eval_keep_recent: int = 30
+    # 回归基线取最近 N 次评估的均值；默认 1 = 最近一次。
+    # 若 Ragas 单次波动导致误报，可调大为 3 或 5（需配合 rag_eval_keep_recent 足够大）。
+    rag_eval_baseline_window: int = 1
+    # 某指标相对基线下降超过该阈值（绝对值，0~1）即判定为回归。
+    rag_eval_regression_threshold: float = 0.05
+    # 触发评估子进程的超时（秒）。评估会用 LLM 逐个样本生成+打分，大模型慢时易触顶，不宜设过小。
+    rag_eval_subprocess_timeout: int = 1800
+
+    # Upload 文件上传存储路径配置
+    upload_dir: str = "./data/uploads"
+    max_upload_size_mb: int = 50
+    # 多进程部署配置
+    web_concurrency: int = 4
+
+    # Celery 异步任务队列配置（为空字符串时不启用 Celery，回退 BackgroundTasks）
+    celery_broker_url: str = ""
+    celery_result_backend: str = ""
+    # celery异步处理开关
+    use_celery_task: bool = False
+
+    # CORS（逗号分隔，生产环境必须覆盖；允许从 CORS_ORIGINS 环境变量读取）
+    cors_origins: list[str] = ["*"]
+
+    # 限流配置
+    rate_limit_enabled: bool = False
+    rate_limit_default: str = "30/minute"
+    rate_limit_llm_query: str = "10/minute"
+    rate_limit_login: str = "5/minute"
+    rate_limit_upload: str = "5/minute"
+
+    # Redis BM25 缓存版本号键的 TTL（秒）：文档变更时 mark_bm25_data_changed 会把数据版本号时间戳 setex 到 Redis（键 bm25:ts:<user>）。查询时对比本地 _bm25_ts_map（上次重建时间）与该版本号：本地产出 >= Redis 版本号，命中本地缓存；否则失效从 DB 重建。该 TTL 仅作版本号键的过期兜底（过期则退化为本地时间戳短 TTL 兜底），并非缓存本身的生命周期。仅在 celery_broker_url 配置了 Redis 且 rag_sparse_backend=bm25_memory 时生效。
+    redis_bm25_cache_ttl_seconds: int = 300
+
+    @property
+    def upload_path(self) -> Path:
+        """获取上传文件路径的属性方法
+
+        Returns:
+            Path: 返回上传目录的Path对象，用于处理文件上传路径
+        """
+        return Path(self.upload_dir)
+
+    @property
+    def jwt_access_expire_seconds(self) -> int:
+        """获取JWT访问令牌的过期时间（秒）
+
+        Returns:
+            int: 返回JWT访问令牌的过期时间，以秒为单位
+        """
+        # 将分钟转换为秒，返回秒数作为过期时间
+        return self.jwt_access_token_expire_minutes * 60
+
+    @property
+    def jwt_refresh_expire_seconds(self) -> int:
+        """获取JWT刷新令牌的过期时间（秒）
+
+        Returns:
+            int: 返回JWT刷新令牌的过期时间，单位为秒
+        """
+        # 将天转换为秒（86400秒=1天）
+        return self.jwt_refresh_token_expire_days * 86400
+
+    @model_validator(mode="after")
+    def validate_production(self):
+        """生产环境强制安全校验，防止默认值上线。"""
+        if self.environment == "production":
+            if self.jwt_secret_key == "dev-secret-key-do-not-use-in-production-123456":
+                raise ValueError("生产环境必须修改 JWT_SECRET_KEY，禁止使用默认值")
+            if self.cors_origins == ["*"]:
+                raise ValueError("生产环境 CORS 不允许通配符，请设置 CORS_ORIGINS")
+            if not self.vector_store_url:
+                raise ValueError("生产环境必须配置 VECTOR_STORE_URL（PGVector 连接串）")
+        return self
+
+
+settings = Settings()
