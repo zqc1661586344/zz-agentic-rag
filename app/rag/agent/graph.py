@@ -6,6 +6,17 @@
 """
 
 import threading
+from langgraph.graph import END, START, StateGraph
+
+from app.rag.agent.nodes import (
+    analyze_query,
+    free_chat,
+    generate,
+    grade_relevance,
+    re_retrieve,
+    retrieve,
+)
+from app.rag.agent.state import AgentRAGState
 
 from app.logging_config import get_logger
 
@@ -34,10 +45,6 @@ def _not_found(node_state: dict) -> dict:
 
 def _build_retrieval_graph():
     """编译『检索决策』图：analyze → retrieve → grade ──(relevant)→ found / (重试)→ re_retrieve→retrieve / (耗尽)→ not_found。"""
-    from langgraph.graph import END, START, StateGraph
-
-    from app.rag.agent.nodes import analyze_query, grade_relevance, re_retrieve, retrieve
-    from app.rag.agent.state import AgentRAGState
 
     builder = StateGraph(AgentRAGState)
     builder.add_node("analyze", analyze_query)
@@ -64,17 +71,6 @@ def _build_retrieval_graph():
 
 def _build_full_graph():
     """编译『完整』图：判分相关→generate，未命中→free_chat。"""
-    from langgraph.graph import END, START, StateGraph
-
-    from app.rag.agent.nodes import (
-        analyze_query,
-        free_chat,
-        generate,
-        grade_relevance,
-        re_retrieve,
-        retrieve,
-    )
-    from app.rag.agent.state import AgentRAGState
 
     builder = StateGraph(AgentRAGState)
     builder.add_node("analyze", analyze_query)
@@ -90,7 +86,11 @@ def _build_full_graph():
     builder.add_conditional_edges(
         "grade",
         _route_full,
-        {"generate": "generate", "re_retrieve": "re_retrieve", "free_chat": "free_chat"},
+        {
+            "generate": "generate",
+            "re_retrieve": "re_retrieve",
+            "free_chat": "free_chat",
+        },
     )
     builder.add_edge("re_retrieve", "retrieve")
     builder.add_edge("generate", END)
