@@ -3,11 +3,11 @@
 供 agent 图节点调用；函数体内惰性 import 以避免与 chain.py 形成循环依赖。
 """
 
-import logging
-
 from langchain_core.documents import Document
 
-logger = logging.getLogger(__name__)
+from app.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 def hybrid_search_tool(query: str, top_k: int = 5, user_id: str | None = None) -> list[Document]:

@@ -1,12 +1,16 @@
 """Agentic RAG 图节点 —— 检索决策阶段（路由 / 检索 / 判分 / 纠偏 / 生成 / 自由对话）。
 
-节点的生成部分复用 chain.py 的现有轻量链（RAG_PROMPT / FREE_CHAT_PROMPT），
-保证生成逻辑、[Source N] 引用与流式协议与旧漏斗完全一致；仅前置"检索决策"被 agent 化。
+节点的生成部分复用 chain.py 的现有轻量链（RAG_PROMPT / FREE_CHAT_PROMPT），保证生成逻辑、[Source N] 引用与流式协议与旧漏斗完全一致；仅前置"检索决策"被 agent 化。
 """
 
 from pydantic import BaseModel, Field
 
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+
 from app.config import settings
+from app.rag.llms import get_llm
+
 from app.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -31,8 +35,7 @@ class GradeResult(BaseModel):
 def analyze_query(state: dict) -> dict:
     """分析节点：多轮改写 + 设定默认检索计划。
 
-    路由决策不在此处用额外的 LLM 预先分流到自由对话（保留旧语义："free_chat 只能在
-    检索判分后仍未命中时触发"），避免为常规问题增加一次不必要的 LLM 调用。
+    路由决策不在此处用额外的 LLM 预先分流到自由对话（保留旧语义："free_chat 只能在检索判分后仍未命中时触发"），避免为常规问题增加一次不必要的 LLM 调用。
     """
     from app.rag.chain import _rewrite_query
 
@@ -43,7 +46,10 @@ def analyze_query(state: dict) -> dict:
     return {
         "rewrite_query": rewrite,
         "iteration": state.get("iteration", 0),
-        "plan": {"mode": "retrieve"},
+        "plan": {
+            "mode": "retrieve",
+            "top_k": int(state.get("plan", {}).get("top_k") or 10),
+        },
         "docs": [],
         "grade": None,
     }
@@ -86,6 +92,7 @@ def grade_relevance(state: dict) -> dict:
                 "reason": "未检索到任何相关内容，需要纠偏重检索或转为自由对话",
             }
         }
+
     if not settings.rag_agentic_grade_enabled:
         return {"grade": {"is_relevant": True, "score": 1.0, "reason": "判分关闭，信任检索结果"}}
 
@@ -102,12 +109,6 @@ def grade_relevance(state: dict) -> dict:
 
 def _llm_grade(query: str, context: str) -> GradeResult:
     """LLM 结构化判分；不可用时返回默认（信任检索）。"""
-    from langchain_core.output_parsers import StrOutputParser
-    from langchain_core.prompts import ChatPromptTemplate
-
-    from app.rag.agent.prompts import GRADE_HUMAN, GRADE_SYSTEM
-    from app.rag.llms import get_llm
-
     llm = get_llm()
 
     # 尝试结构化输出（openai/兼容协议、ollama 的 with_structured_output）
@@ -119,7 +120,7 @@ def _llm_grade(query: str, context: str) -> GradeResult:
 
     # 降级：文本生成 → 正则解析；解析失败默认信任检索（is_relevant=True）
     try:
-        from langchain_core.runnables import RunnablePassthrough
+        from app.rag.agent.prompts import GRADE_HUMAN, GRADE_SYSTEM
 
         prompt = ChatPromptTemplate.from_messages(
             [("system", GRADE_SYSTEM), ("human", GRADE_HUMAN)]
@@ -133,29 +134,59 @@ def _llm_grade(query: str, context: str) -> GradeResult:
 
 
 def _parse_grade_text(raw: str) -> GradeResult:
-    """从文本中解析 is_relevant / score / reason。"""
+    """从文本中解析 is_relevant / score / reason（统一中英文判定口径）。"""
     import re
 
     text = raw.strip()
-    relevant = "不相关" not in text and 'is_relevant": false' not in text.replace(" ", "")
-    score_m = re.search(r"score[\"':\s]*([\d.]+)", text, re.IGNORECASE)
-    score = float(score_m.group(1)) if score_m else (1.0 if relevant else 0.0)
-    reason_m = re.search(r"reason[\"':\s]+(.+)", text, re.IGNORECASE)
-    reason = reason_m.group(1).strip() if reason_m else ""
-    return GradeResult(is_relevant=bool(relevant), score=score, reason=reason)
+    s = text.replace(" ", "").replace("\u3000", "")  # 去半角+全角空格，规避格式差异
+
+    # 1) 判分依据：统一归一到"显式正/负判断"，不再用排除法
+    exclusions = [
+        "不相关",
+        "无关",
+        "无法回答",
+        "is_relevant:false",
+        '"is_relevant":false',
+        "relevance:false",
+    ]
+    positive = [
+        "直接相关",
+        "可以回答",
+        "is_relevant:true",
+        '"is_relevant":true',
+        "relevance:true",
+    ]
+
+    if any(k in s for k in exclusions):
+        relevant = False
+    elif any(k in s for k in positive):
+        relevant = True
+    else:
+        relevant = True  # 兜底：文本无明确信号时信任检索（与降级语义一致）
+
+    # 2) score：优先匹配数字，注意 true/false 别被误当数值
+    score_m = re.search(r"score[\"':\s]*([\d.]+)", s, re.IGNORECASE)
+    if score_m:
+        try:
+            score = max(0.0, min(1.0, float(score_m.group(1))))
+        except ValueError:
+            score = 1.0 if relevant else 0.0
+    else:
+        score = 1.0 if relevant else 0.0
+
+    # 3) reason：贪婪取到句末
+    reason_m = re.search(r"reason[\"':\s]+(.+)", s, re.IGNORECASE)
+    reason = reason_m.group(1).strip().strip('"').strip() if reason_m else ""
+    return GradeResult(is_relevant=relevant, score=score, reason=reason)
 
 
 def re_retrieve(state: dict) -> dict:
     """纠偏节点：依据判分反馈改写查询，供下一轮检索。"""
-    from langchain_core.output_parsers import StrOutputParser
-    from langchain_core.prompts import ChatPromptTemplate
-
-    from app.rag.agent.prompts import REWRITE_HUMAN, REWRITE_SYSTEM
-    from app.rag.llms import get_llm
-
     query = state.get("rewrite_query") or state.get("query", "")
     reason = (state.get("grade") or {}).get("reason", "检索结果与问题不相关")
     try:
+        from app.rag.agent.prompts import REWRITE_HUMAN, REWRITE_SYSTEM
+
         prompt = ChatPromptTemplate.from_messages(
             [("system", REWRITE_SYSTEM), ("human", REWRITE_HUMAN)]
         )

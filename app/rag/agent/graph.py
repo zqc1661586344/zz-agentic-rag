@@ -6,6 +6,9 @@
 """
 
 import threading
+from functools import partial
+from typing import Callable
+
 from langgraph.graph import END, START, StateGraph
 
 from app.rag.agent.nodes import (
@@ -23,8 +26,7 @@ from app.logging_config import get_logger
 logger = get_logger(__name__)
 
 # 编译后的图缓存（一次构建，跨查询复用）
-_retrieval_graph = None
-_full_graph = None
+_graph_registry: dict[str, object] = {}
 _graph_lock = threading.Lock()
 
 
@@ -60,7 +62,11 @@ def _build_retrieval_graph():
     builder.add_conditional_edges(
         "grade",
         _route_retrieval,
-        {"found": "found", "re_retrieve": "re_retrieve", "not_found": "not_found"},
+        {
+            "found": "found",
+            "re_retrieve": "re_retrieve",
+            "not_found": "not_found",
+        },
     )
     builder.add_edge("re_retrieve", "retrieve")
     builder.add_edge("found", END)
@@ -99,24 +105,22 @@ def _build_full_graph():
     return builder.compile()
 
 
-def _route_retrieval(state: dict) -> str:
-    """检索决策图的路由：相关→found；轮次耗尽→not_found；否则→纠偏。"""
+def _route(state: dict, good: str, exhausted: str) -> str:
+    """共享路由逻辑：相关→good 终端；轮次耗尽→exhausted 终端；否则→纠偏。"""
     grade = state.get("grade") or {}
     if grade.get("is_relevant"):
-        return "found"
+        return good
     if (state.get("iteration") or 1) >= _max_rounds():
-        return "not_found"
+        return exhausted
     return "re_retrieve"
 
 
-def _route_full(state: dict) -> str:
-    """完整图的路由：相关→generate；轮次耗尽→free_chat；否则→纠偏。"""
-    grade = state.get("grade") or {}
-    if grade.get("is_relevant"):
-        return "generate"
-    if (state.get("iteration") or 1) >= _max_rounds():
-        return "free_chat"
-    return "re_retrieve"
+# 两个图各自的路由（partial 可被标准 pickle 序列化，兼容跨进程 checkpoint）
+# 检索决策图的路由：相关→found；轮次耗尽→not_found；否则→纠偏。
+_route_retrieval = partial(_route, good="found", exhausted="not_found")
+
+# 完整图的路由：相关→generate；轮次耗尽→free_chat；否则→纠偏。
+_route_full = partial(_route, good="generate", exhausted="free_chat")
 
 
 def _max_rounds() -> int:
@@ -125,22 +129,25 @@ def _max_rounds() -> int:
     return settings.rag_agentic_max_retrieval_rounds
 
 
-def _get_retrieval_graph():
-    global _retrieval_graph
-    if _retrieval_graph is None:
+def _get_graph(builder: Callable[[], object]) -> object:
+    """双检锁惰性编译并缓存单个图。"""
+    key = builder.__name__
+    cached = _graph_registry.get(key)
+    if cached is None:
         with _graph_lock:
-            if _retrieval_graph is None:
-                _retrieval_graph = _build_retrieval_graph()
-    return _retrieval_graph
+            cached = _graph_registry.get(key)
+            if cached is None:
+                cached = builder()
+                _graph_registry[key] = cached
+    return cached
+
+
+def _get_retrieval_graph():
+    return _get_graph(_build_retrieval_graph)
 
 
 def _get_full_graph():
-    global _full_graph
-    if _full_graph is None:
-        with _graph_lock:
-            if _full_graph is None:
-                _full_graph = _build_full_graph()
-    return _full_graph
+    return _get_graph(_build_full_graph)
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +163,7 @@ def run_agentic_retrieve(
     user_id: str | None = None,
 ) -> dict:
     """仅运行检索决策阶段，返回 {docs, free_chat}。供流式/非流式共用。"""
+    # 检索决策图
     graph = _get_retrieval_graph()
     result = graph.invoke(
         {
@@ -182,6 +190,7 @@ def run_agentic(
     history_text: str = "",
 ) -> dict:
     """完整链路（检索决策 + 生成），返回 {answer, sources, chunks, free_chat}。"""
+    # 完整图
     graph = _get_full_graph()
     result = graph.invoke(
         {
