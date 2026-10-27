@@ -378,7 +378,18 @@ def _rrf_fuse(
             if cur is None:
                 ranked[key] = (contribution, doc)
             else:
-                ranked[key] = (cur[0] + contribution, doc)
+                # ranked[key] = (cur[0] + contribution, doc)
+                cur_score, cur_doc = cur
+                # 保留带来源名（filename/source）的那份，避免稀疏侧缺元数据的对象，覆盖稠密侧完整对象，导致前端来源显示 Unknown
+                prev_has = bool(
+                    (cur_doc.metadata or {}).get("filename")
+                    or (cur_doc.metadata or {}).get("source")
+                )
+                new_has = bool(
+                    (doc.metadata or {}).get("filename") or (doc.metadata or {}).get("source")
+                )
+                chosen = doc if (new_has and not prev_has) else cur_doc
+                ranked[key] = (cur_score + contribution, chosen)
 
     # 按融合分降序
     ordered = sorted(ranked.values(), key=lambda v: v[0], reverse=True)
@@ -600,7 +611,18 @@ def _cross_query_fuse(
             if cur is None:
                 agg[key] = (contribution, doc)
             else:
-                agg[key] = (cur[0] + contribution, doc)
+                # agg[key] = (cur[0] + contribution, doc)
+                cur_score, cur_doc = cur
+                # 与 _rrf_fuse 一致：优先保留带来源名（filename/source）的对象
+                prev_has = bool(
+                    (cur_doc.metadata or {}).get("filename")
+                    or (cur_doc.metadata or {}).get("source")
+                )
+                new_has = bool(
+                    (doc.metadata or {}).get("filename") or (doc.metadata or {}).get("source")
+                )
+                chosen = doc if (new_has and not prev_has) else cur_doc
+                agg[key] = (cur_score + contribution, chosen)
 
     ordered = sorted(agg.values(), key=lambda v: v[0], reverse=True)
     return [doc for _, doc in ordered][:top_k]

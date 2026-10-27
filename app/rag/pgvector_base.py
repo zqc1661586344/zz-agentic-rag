@@ -84,6 +84,22 @@ def delete_by_metadata(collection_name: str, metadata_key: str, metadata_value: 
                 ),
                 {"c": collection_name, "k": metadata_key, "v": metadata_value},
             )
+            # 兜底：清掉该 collection 下所有"无 document_id"的孤儿向量
+            # 仅在按 document_id 删除时触发，避免误删 key 存为 null 的其它合法场景
+            if metadata_key == "document_id":
+                conn.execute(
+                    text(
+                        "DELETE FROM langchain_pg_embedding "
+                        "WHERE collection_id = (SELECT uuid FROM langchain_pg_collection "
+                        "  WHERE name = :c) "
+                        "AND (cmetadata->>'document_id') IS NULL"
+                    ),
+                    {"c": collection_name},
+                )
+                logger.info(
+                    "pgvector orphan cleanup: collection=%s (no document_id)",
+                    collection_name,
+                )
             logger.info(
                 "pgvector delete: collection=%s %s=%s",
                 collection_name,

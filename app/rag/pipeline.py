@@ -57,6 +57,22 @@ def _load_doc_or_fail(db: Session, doc_id: str) -> DocModel | None:
     return doc
 
 
+def _ensure_source_name(chunks: list[Document], default_name: str) -> list[Document]:
+    """兜底归一化：确保每个 chunk 都有来源名（filename 或 source）。
+
+    splitter 可能在不同实现下遗漏 base 元数据的补回（历史遗留数据即因此缺失）。
+    这里在切分后统一兜底，避免下游 _resolve_source_name 回退到 "Unknown"。
+    """
+    for chunk in chunks:
+        meta = chunk.metadata
+        # 已含来源名 → 跳过
+        if meta.get("filename") or meta.get("source"):
+            continue
+        # 用文档级文件名兜底补齐
+        meta["filename"] = default_name
+    return chunks
+
+
 def _load_and_split(doc: DocModel) -> list[Document] | None:
     """加载文件并切分为 chunks。
 
@@ -85,6 +101,9 @@ def _load_and_split(doc: DocModel) -> list[Document] | None:
 
     splitter = get_splitter_for(doc.original_filename)
     chunks = splitter.split_documents(raw_docs)
+
+    # 兜底：保证每个 chunk 都带来源名，防止缺元数据的 chunk 在前端显示 Unknown
+    chunks = _ensure_source_name(chunks, doc.original_filename)
 
     if not chunks:
         logger.warning("document %s: empty after splitting, marked failed", doc.id)

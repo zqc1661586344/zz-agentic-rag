@@ -115,7 +115,7 @@ def tsvector_search(query: str, top_k: int = 5, user_id: str | None = None) -> l
 
     sql = text(
         f"""
-        SELECT c.id AS chunk_id, c.content, c.meta,
+        SELECT c.id AS chunk_id, c.content, c.meta, d.original_filename AS fs_filename,
                ts_rank(to_tsvector('simple', c.search_text), q.ts, 1) AS r
         FROM document_chunks c
         JOIN documents d ON d.id = c.document_id
@@ -156,6 +156,8 @@ def tsvector_search(query: str, top_k: int = 5, user_id: str | None = None) -> l
         # 统一 metadata：让稀疏结果的 document_id/源信息与稠密结果对齐，便于 RRF 去重。
         meta.setdefault("chunk_id", row["chunk_id"])
         meta.setdefault("content", row["content"])
+        if row["fs_filename"]:
+            meta.setdefault("filename", row["fs_filename"])
 
         # 稀疏质量分：SQL 里算出的归一化 ts_rank r（与 WHERE 把关同一尺度）。把关已在 SQL WHERE 完成，此分仅透出供日志/调试，hybrid 不再重复过滤。
         meta.setdefault("sparse_score", row["r"])
